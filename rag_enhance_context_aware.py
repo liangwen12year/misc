@@ -5,19 +5,21 @@ import faiss
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import logging
+from scipy.special import softmax
 
 # Disable unnecessary logs
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 MODEL_SAVE_DIR = "/local/speech/users/wl2904"
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 class RAGConversationSystem:
-    def __init__(self, embedding_model_name="all-MiniLM-L6-v2", llm_model_name="meta-llama/Llama-3.1-8B-Instruct", max_history=20):
+    def __init__(self, embedding_model_name="all-MiniLM-L6-v2",
+                 llm_model_name="meta-llama/Llama-3.1-8B-Instruct",
+                 max_history=20):
         """
-        Initialize the RAG conversation system with embedding model, LLM, and FAISS index.
+        Initialize the RAG conversation system with an embedding model, LLM, and FAISS index.
         """
         # Load embedding model
         self.embedding_model = SentenceTransformer(embedding_model_name, cache_folder=MODEL_SAVE_DIR)
@@ -58,7 +60,10 @@ class RAGConversationSystem:
             with open(file_path, "r") as f:
                 self.conversation_history = json.load(f)
                 # Rebuild FAISS index with the last `max_history` turns
-                self.embeddings = np.array([self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}") for turn in self.conversation_history[-self.max_history:]])
+                self.embeddings = np.array([
+                    self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}")
+                    for turn in self.conversation_history[-self.max_history:]
+                ])
                 if len(self.embeddings) > 0:
                     self.faiss_index.reset()
                     self.faiss_index.add(self.embeddings)
@@ -77,7 +82,10 @@ class RAGConversationSystem:
         if len(self.conversation_history) > self.max_history:
             self.conversation_history.pop(0)
             # Rebuild embeddings and FAISS index
-            self.embeddings = np.array([self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}") for turn in self.conversation_history])
+            self.embeddings = np.array([
+                self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}")
+                for turn in self.conversation_history
+            ])
             self.faiss_index.reset()
             if len(self.embeddings) > 0:
                 self.faiss_index.add(self.embeddings)
@@ -96,24 +104,44 @@ class RAGConversationSystem:
 
         # Embed the query
         query_embedding = self.embedding_model.encode([query])
-
         # Search FAISS for the most relevant context
         distances, indices = self.faiss_index.search(query_embedding, top_k)
-
-        # Retrieve the relevant context
+        # Retrieve the relevant context turns
         relevant_context = [self.conversation_history[i] for i in indices[0] if i < len(self.conversation_history)]
         return relevant_context
 
     def generate_response(self, query, relevant_context):
         """
-        Generate a concise and contextually relevant response using the LLM.
+        Generate a context-aware response using the LLM with an attention mechanism over the retrieved context.
         """
-        # Prepare input text for the LLM
         if not relevant_context:
             input_text = f"User: {query}\nModel:"
         else:
-            # Include only the most relevant context
-            context_str = "\n".join([f"User: {turn['user']}\nModel: {turn['model']}" for turn in relevant_context])
+            # Compute the query embedding
+            query_embedding = self.embedding_model.encode(query)
+            # Compute embeddings for each retrieved context turn
+            context_embeddings = []
+            for turn in relevant_context:
+                context_text = f"User: {turn['user']}\nModel: {turn['model']}"
+                emb = self.embedding_model.encode(context_text)
+                context_embeddings.append(emb)
+            context_embeddings = np.array(context_embeddings)
+
+            # Compute cosine similarities between the query and each context embedding
+            dot_products = np.dot(context_embeddings, query_embedding)
+            norms_context = np.linalg.norm(context_embeddings, axis=1)
+            norm_query = np.linalg.norm(query_embedding)
+            cosine_similarities = dot_products / (norms_context * norm_query + 1e-8)
+
+            # Compute attention weights using softmax
+            attn_weights = softmax(cosine_similarities)
+
+            # Build context string with attention weights annotated
+            weighted_context_parts = []
+            for i, turn in enumerate(relevant_context):
+                weight = attn_weights[i]
+                weighted_context_parts.append(f"(attn: {weight:.2f}) User: {turn['user']}\nModel: {turn['model']}")
+            context_str = "\n".join(weighted_context_parts)
             input_text = f"Context:\n{context_str}\nUser: {query}\nModel:"
 
         # Tokenize the input text
@@ -130,13 +158,12 @@ class RAGConversationSystem:
         # Generate response
         outputs = self.llm_model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,  # Control the number of new tokens generated
+            max_new_tokens=max_new_tokens,
             pad_token_id=self.tokenizer.eos_token_id,
-            temperature=0.7,  # Adjust for more focused responses
-            top_p=0.9,  # Use nucleus sampling to avoid overly verbose outputs
+            temperature=0.7,
+            top_p=0.9,
         )
         response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-
         # Extract only the model's response
         response = response.split("Model:")[-1].strip()
         return response
