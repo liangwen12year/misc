@@ -1,11 +1,12 @@
 import json
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 import faiss
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 import logging
-from scipy.special import softmax
 
 # Disable unnecessary logs
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -19,69 +20,175 @@ class RAGConversationSystem:
                  llm_model_name="meta-llama/Llama-3.1-8B-Instruct",
                  max_history=20):
         """
-        Initialize the RAG conversation system with an embedding model, LLM, and FAISS index.
+        Initialize the enhanced RAG system with attention-based context fusion.
         """
         # Load embedding model
         self.embedding_model = SentenceTransformer(embedding_model_name, cache_folder=MODEL_SAVE_DIR)
         self.embedding_size = self.embedding_model.get_sentence_embedding_dimension()
 
-        # Load LLM and tokenizer
+        # Load LLM
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name, cache_dir=MODEL_SAVE_DIR)
         self.llm_model = AutoModelForCausalLM.from_pretrained(llm_model_name, cache_dir=MODEL_SAVE_DIR).to(device)
 
-        # Initialize conversation history and embeddings
+        # Initialize conversation history
         self.conversation_history = []
-        self.embeddings = np.empty((0, self.embedding_size))  # Dynamic embedding storage
+        self.embeddings = np.empty((0, self.embedding_size))
 
-        # Initialize FAISS index (GPU if available)
+        # Initialize FAISS index for dynamic retrieval
         self.faiss_index = faiss.IndexFlatL2(self.embedding_size)
         if device == "cuda":
             res = faiss.StandardGpuResources()
             self.faiss_index = faiss.index_cpu_to_gpu(res, 0, self.faiss_index)
 
-        # Maximum number of conversation turns to keep
+        # Context management
         self.max_history = max_history
 
-        # Track key facts (e.g., user preferences)
-        self.key_facts = {}
+        # NEW: Attention layer for context fusion (learnable weights)
+        self.attention = nn.Linear(self.embedding_size, 1).to(device)
 
-    def save_conversation_history(self, file_path="conversation_history.json"):
+    def _compute_attention_weights(self, query_embedding, context_embeddings):
         """
-        Save the conversation history to a JSON file.
+        Compute attention weights by combining query and context features.
+        Args:
+            query_embedding: Current query embedding (dim,)
+            context_embeddings: Stack of context embeddings (N, dim)
+        Returns:
+            weights: Normalized relevance scores (N,)
         """
-        with open(file_path, "w") as f:
-            json.dump(self.conversation_history, f)
+        # Broadcast multiplication to combine query and each context
+        combined = query_embedding.unsqueeze(0) * context_embeddings  # shape (N, dim)
+        # Compute raw scores using the learnable attention layer
+        scores = self.attention(combined).squeeze(-1)  # shape (N,)
+        # Normalize with softmax
+        return F.softmax(scores, dim=0)
 
-    def load_conversation_history(self, file_path="conversation_history.json"):
+    def _retrieve_static_docs(self, query, top_k=2):
         """
-        Load conversation history from a JSON file and rebuild the FAISS index.
+        Placeholder for static knowledge retrieval (e.g., from Wikipedia).
+        Replace with your actual retrieval method.
         """
-        try:
-            with open(file_path, "r") as f:
-                self.conversation_history = json.load(f)
-                # Rebuild FAISS index with the last `max_history` turns
-                self.embeddings = np.array([
-                    self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}")
-                    for turn in self.conversation_history[-self.max_history:]
-                ])
-                if len(self.embeddings) > 0:
-                    self.faiss_index.reset()
-                    self.faiss_index.add(self.embeddings)
-        except FileNotFoundError:
-            # Suppress the message about no existing history
-            self.conversation_history = []
+        # Mock implementation - replace with real retrieval if needed
+        return [{"content": f"Static doc about '{query[:20]}...'", "source": "Wikipedia"}]
+
+    def retrieve_relevant_context(self, query, top_k=3):
+        """
+        Enhanced retrieval with attention-weighted fusion of:
+        - Static knowledge (from RAG)
+        - Dynamic history (from conversation)
+        """
+        query_embedding = self.embedding_model.encode(query, convert_to_tensor=True).to(device)
+
+        # Retrieve static docs
+        static_docs = self._retrieve_static_docs(query)
+
+        # Retrieve dynamic history using FAISS
+        dynamic_context = []
+        if len(self.conversation_history) > 0:
+            _, indices = self.faiss_index.search(
+                query_embedding.cpu().numpy().reshape(1, -1),
+                top_k
+            )
+            dynamic_context = [
+                {"type": "history", "content": self.conversation_history[i]}
+                for i in indices[0] if i < len(self.conversation_history)
+            ]
+
+        # Combine both contexts
+        all_context = (
+            [{"type": "static", "content": doc} for doc in static_docs] +
+            dynamic_context
+        )
+
+        if not all_context:
+            return []
+
+        # Compute embeddings for each context entry
+        context_embeddings = torch.stack([
+            self.embedding_model.encode(str(ctx["content"]), convert_to_tensor=True)
+            for ctx in all_context
+        ]).to(device)
+
+        # Calculate attention weights with the new mechanism
+        weights = self._compute_attention_weights(query_embedding, context_embeddings)
+
+        # Detach weights before converting to NumPy to avoid gradient issues
+        sorted_contexts = sorted(
+            zip(all_context, weights.detach().cpu().numpy()),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]
+
+        return sorted_contexts
+
+    def _build_conversation_history_block(self):
+        """
+        Build a chronological block of the recent conversation history.
+        """
+        history_lines = []
+        for turn in self.conversation_history[-self.max_history:]:
+            history_lines.append(f"User: {turn['user']}\nModel: {turn['model']}")
+        return "\n\n".join(history_lines)
+
+    def generate_response(self, query, weighted_contexts):
+        """
+        Generate response using attention-weighted context and full conversation history.
+        """
+        # Build the conversation history block
+        conversation_history_text = self._build_conversation_history_block()
+
+        # Build the relevant context block from weighted contexts
+        relevant_context_lines = []
+        for ctx, weight in weighted_contexts:
+            if ctx["type"] == "static":
+                # For static docs, include the source information
+                relevant_context_lines.append(
+                    f"[Relevance: {weight:.2f}] Knowledge: {ctx['content']['content']} (Source: {ctx['content']['source']})"
+                )
+            else:
+                hist = ctx["content"]
+                relevant_context_lines.append(
+                    f"[Relevance: {weight:.2f}] Past Conversation:\nUser: {hist['user']}\nModel: {hist['model']}"
+                )
+        relevant_context_text = "\n".join(relevant_context_lines)
+
+        # Build the full prompt with clear instructions
+        prompt_parts = [
+            "You are a context-aware assistant that uses both conversation history and relevant background knowledge to generate accurate and personalized responses.",
+            "Recent Conversation History:\n" + (conversation_history_text if conversation_history_text else "None"),
+            "Relevant Context Retrieved:\n" + (relevant_context_text if relevant_context_text else "None"),
+            f"User: {query}",
+            "Model:"
+        ]
+        full_prompt = "\n\n".join(prompt_parts)
+
+        # Tokenize prompt and check length
+        inputs = self.tokenizer(full_prompt, return_tensors="pt").to(device)
+        input_length = inputs["input_ids"].shape[1]
+
+        max_new_tokens = min(150, self.llm_model.config.max_position_embeddings - input_length - 1)
+        if max_new_tokens <= 0:
+            raise ValueError("Input too long. Reduce context size.")
+
+        # Generate response from the LLM
+        outputs = self.llm_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            num_return_sequences=1,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True
+        )
+
+        response = self.tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
+        return response.strip()
 
     def update_rag_database(self, user_query, model_response):
-        """
-        Update the conversation history and FAISS index with a new turn.
-        """
-        # Add the new turn to the conversation history
+        """Update conversation history and FAISS index."""
         self.conversation_history.append({"user": user_query, "model": model_response})
 
-        # Remove the oldest turn if history exceeds max_history
+        # Update FAISS index either incrementally or rebuild if history exceeds max_history
         if len(self.conversation_history) > self.max_history:
             self.conversation_history.pop(0)
-            # Rebuild embeddings and FAISS index
             self.embeddings = np.array([
                 self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}")
                 for turn in self.conversation_history
@@ -90,118 +197,55 @@ class RAGConversationSystem:
             if len(self.embeddings) > 0:
                 self.faiss_index.add(self.embeddings)
         else:
-            # Embed the new turn and update FAISS index
-            new_embedding = self.embedding_model.encode(f"User: {user_query}\nModel: {model_response}").reshape(1, -1)
+            new_embedding = self.embedding_model.encode(
+                f"User: {user_query}\nModel: {model_response}"
+            ).reshape(1, -1)
             self.embeddings = np.vstack([self.embeddings, new_embedding])
             self.faiss_index.add(new_embedding)
 
-    def retrieve_relevant_context(self, query, top_k=2):
-        """
-        Retrieve the most relevant context from the conversation history using FAISS.
-        """
-        if len(self.conversation_history) == 0:
-            return []
-
-        # Embed the query
-        query_embedding = self.embedding_model.encode([query])
-        # Search FAISS for the most relevant context
-        distances, indices = self.faiss_index.search(query_embedding, top_k)
-        # Retrieve the relevant context turns
-        relevant_context = [self.conversation_history[i] for i in indices[0] if i < len(self.conversation_history)]
-        return relevant_context
-
-    def generate_response(self, query, relevant_context):
-        """
-        Generate a context-aware response using the LLM with an attention mechanism over the retrieved context.
-        """
-        if not relevant_context:
-            input_text = f"User: {query}\nModel:"
-        else:
-            # Compute the query embedding
-            query_embedding = self.embedding_model.encode(query)
-            # Compute embeddings for each retrieved context turn
-            context_embeddings = []
-            for turn in relevant_context:
-                context_text = f"User: {turn['user']}\nModel: {turn['model']}"
-                emb = self.embedding_model.encode(context_text)
-                context_embeddings.append(emb)
-            context_embeddings = np.array(context_embeddings)
-
-            # Compute cosine similarities between the query and each context embedding
-            dot_products = np.dot(context_embeddings, query_embedding)
-            norms_context = np.linalg.norm(context_embeddings, axis=1)
-            norm_query = np.linalg.norm(query_embedding)
-            cosine_similarities = dot_products / (norms_context * norm_query + 1e-8)
-
-            # Compute attention weights using softmax
-            attn_weights = softmax(cosine_similarities)
-
-            # Build context string with attention weights annotated
-            weighted_context_parts = []
-            for i, turn in enumerate(relevant_context):
-                weight = attn_weights[i]
-                weighted_context_parts.append(f"(attn: {weight:.2f}) User: {turn['user']}\nModel: {turn['model']}")
-            context_str = "\n".join(weighted_context_parts)
-            input_text = f"Context:\n{context_str}\nUser: {query}\nModel:"
-
-        # Tokenize the input text
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(device)
-        input_length = inputs["input_ids"].shape[1]
-
-        # Dynamically adjust max_new_tokens to avoid exceeding the model's token limit
-        max_model_length = self.llm_model.config.max_position_embeddings  # Maximum token limit for the model
-        max_new_tokens = min(100, max_model_length - input_length - 1)  # Limit response length
-
-        if max_new_tokens <= 0:
-            raise ValueError("Input length exceeds the model's maximum token limit. Please reduce the context size.")
-
-        # Generate response
-        outputs = self.llm_model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=self.tokenizer.eos_token_id,
-            temperature=0.7,
-            top_p=0.9,
-        )
-        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Extract only the model's response
-        response = response.split("Model:")[-1].strip()
-        return response
-
     def run_conversation(self):
-        """
-        Run the conversation loop.
-        """
-        print("Starting conversation. Type 'exit' to end.")
+        """Main conversation loop."""
+        print("RAG System Ready. Type 'exit' to quit.")
         while True:
             user_query = input("User: ")
             if user_query.lower() == "exit":
                 break
 
-            # Retrieve relevant context (limit to last 3 turns)
-            relevant_context = self.retrieve_relevant_context(user_query, top_k=3)
+            # Retrieve context with attention weighting
+            context = self.retrieve_relevant_context(user_query)
 
-            # Generate and display response
             try:
-                model_response = self.generate_response(user_query, relevant_context)
-                print(f"Model: {model_response}")
+                # Generate and print response
+                response = self.generate_response(user_query, context)
+                print(f"Model: {response}")
+
+                # Update conversation database
+                self.update_rag_database(user_query, response)
             except ValueError as e:
-                print(f"Model: Error - {e}. Please reduce the context size or start a new conversation.")
+                print(f"Error: {e}")
 
-            # Update the RAG database with the new turn
-            self.update_rag_database(user_query, model_response)
-
-        # Save conversation history at the end
+        # Save conversation history upon exit
         self.save_conversation_history()
-        print("Conversation history saved.")
 
-# Main execution
+    def save_conversation_history(self, path="conversation_history.json"):
+        with open(path, "w") as f:
+            json.dump(self.conversation_history, f)
+
+    def load_conversation_history(self, path="conversation_history.json"):
+        try:
+            with open(path, "r") as f:
+                self.conversation_history = json.load(f)
+                self.embeddings = np.array([
+                    self.embedding_model.encode(f"User: {turn['user']}\nModel: {turn['model']}")
+                    for turn in self.conversation_history[-self.max_history:]
+                ])
+                if len(self.embeddings) > 0:
+                    self.faiss_index.reset()
+                    self.faiss_index.add(self.embeddings)
+        except FileNotFoundError:
+            pass
+
 if __name__ == "__main__":
-    # Initialize the RAG conversation system
-    rag_system = RAGConversationSystem(max_history=100)
-
-    # Load existing conversation history (if any)
+    rag_system = RAGConversationSystem(max_history=15)
     rag_system.load_conversation_history()
-
-    # Start the conversation
     rag_system.run_conversation()
