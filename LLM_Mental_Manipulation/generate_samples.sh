@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail  # No -e to keep processing on error
 
 # Configuration
 CORPUS_DIR="$HOME/.convokit/saved-corpora/movie-corpus"
-UTTERANCE_FILE="$CORPUS_DIR/utterances.jsonl"
+UTTERANCES_FILE="$CORPUS_DIR/utterances.jsonl"
 SCRIPT="./gen_sample_11_lab.py"
 API_KEY="sk_7625b241b028c94cbdc22332e98547d609576805d9f386d2"
 OUTPUT_DIR="./samples"
-NUM_SAMPLES=10
+NUM_SAMPLES=5000  # Limit to 5000 samples
 
 # Requires: jq (for JSON parsing)
 if ! command -v jq &>/dev/null; then
@@ -15,33 +15,39 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-mkdir -p "$OUTPUT_DIR"
-
-# Read first 20 IDs into an array
-mapfile -t ids < <(
-  jq -r '.id' "$UTTERANCE_FILE" | head -n $((NUM_SAMPLES + 1))
-)
-
-# Sanity check
-if [ "${#ids[@]}" -lt $((NUM_SAMPLES + 1)) ]; then
-  echo "⚠️  Not enough utterances in $UTTERANCE_FILE" >&2
+# Check utterances.jsonl exists
+if [ ! -f "$UTTERANCES_FILE" ]; then
+  echo "❌ Error: $UTTERANCES_FILE not found. Ensure the corpus is downloaded." >&2
   exit 1
 fi
 
-# Generate samples
-for i in $(seq 0 $((NUM_SAMPLES - 1))); do
-  prev_id="${ids[$i]}"
-  next_id="${ids[$((i + 1))]}"
-  out="$OUTPUT_DIR/sample_${i}.mp3"
+mkdir -p "$OUTPUT_DIR"
 
-  echo "▶ Generating $out from $prev_id → $next_id"
-  python "$SCRIPT" \
-    -PRI "$prev_id" \
-    -NRI "$next_id" \
+# Extract all unique conversation IDs from utterances.jsonl
+mapfile -t conv_ids < <(
+  jq -r 'select(.conversation_id != null) | .conversation_id' "$UTTERANCES_FILE" | sort -u
+)
+
+total_convs=${#conv_ids[@]}
+echo "ℹ️  Found $total_convs conversations. Generating audio for the first $NUM_SAMPLES samples..."
+
+count=0
+for conv_id in "${conv_ids[@]}"; do
+  if [ "$count" -ge "$NUM_SAMPLES" ]; then
+    break
+  fi
+
+  echo "▶ [$((count+1))/$NUM_SAMPLES] Generating audio for conversation: $conv_id"
+  if ! python "$SCRIPT" \
+    -CONV "$conv_id" \
     -C movie-corpus \
     -k "$API_KEY" \
-    -o "$out"
+    -o "$OUTPUT_DIR"; then
+      echo "⚠️  Skipped conversation $conv_id due to error."
+  fi
+
+  ((count++))
 done
 
-echo "✅ All $NUM_SAMPLES samples written to $OUTPUT_DIR/"
+echo "✅ $NUM_SAMPLES conversations processed. Audios saved to $OUTPUT_DIR/ (reversed composed conversations with 1-sec pauses)"
 
