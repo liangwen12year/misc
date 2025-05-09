@@ -7,6 +7,9 @@ Audio generation pipeline using the ElevenLabs Python SDK and Convokit for conte
       (for all unique speakers, each voicing every turn)
 - ✅ No composed audio.
 - ✅ Every speaker repeats each turn individually.
+- Uses these voices in round‑robin order:
+    Ivanna, Mark, Amanda, Grandpa Spuds Oxley, Grandma Muffin, Sassy Aerisita
+- Skips generating any file already present under ./samples/final/
 """
 
 import sys
@@ -17,15 +20,17 @@ from pathlib import Path
 from elevenlabs.client import ElevenLabs
 
 VOICE_SLOTS = [
-    {"name": "Ivanna", "voice_id": "yM93hbw8Qtvdma2wCnJG"},
-    {"name": "Mark", "voice_id": "UgBBYS2sOqTuMpoF3BR0"},
-    {"name": "Amanda", "voice_id": "M6N6IdXhi5YNZyZSDe7k"},
+    {"name": "Ivanna - Young & Casual",     "voice_id": "yM93hbw8Qtvdma2wCnJG"},
+    {"name": "Mark - Natural Conversations", "voice_id": "UgBBYS2sOqTuMpoF3BR0"},
+    {"name": "Amanda",                       "voice_id": "M6N6IdXhi5YNZyZSDe7k"},
+    {"name": "Grandpa Spuds Oxley",          "voice_id": "NOpBlnGInO9m6vDvFkFC"},
+    {"name": "Grandma Muffin",               "voice_id": "vFLqXa8bgbofGarf6fZh"},
+    {"name": "Sassy Aerisita",               "voice_id": "03vEurziQfq3V8WZhQvn"},
 ]
-
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate TTS audio per turn (all speakers voice every turn). No composed audio."
+        description="Generate TTS audio per turn (all speakers voice every turn). Skips existing files under samples/final/."
     )
     parser.add_argument(
         "--conversation-id", "-CONV",
@@ -40,7 +45,7 @@ def parse_args():
     parser.add_argument(
         "--output", "-o",
         default="./samples/",
-        help="Directory to save generated audio files."
+        help="Directory to save generated audio files (writes here)."
     )
     parser.add_argument(
         "--api-key", "-k",
@@ -52,64 +57,59 @@ def parse_args():
 def fetch_utterances_for_conversation(corpus_dir, conv_id):
     utt_file = os.path.join(corpus_dir, "utterances.jsonl")
     utterances = []
-
     with open(utt_file) as f:
         for line in f:
             obj = json.loads(line)
             if obj.get("conversation_id") == conv_id:
                 utterances.append({"text": obj["text"], "speaker": obj.get("speaker")})
-
     if not utterances:
-        raise ValueError(f"⚠️ No utterances found for conversation '{conv_id}' in utterances.jsonl.")
-
+        raise ValueError(f"⚠️ No utterances found for conversation '{conv_id}'.")
     return utterances
 
 
 def generate_all_speakers_per_turn(client, utterances, conversation_id, output_dir):
-    unique_speakers = list(sorted(set(utt["speaker"] for utt in utterances if utt.get("speaker") is not None)))
+    unique_speakers = sorted({utt["speaker"] for utt in utterances if utt.get("speaker")})
     num_speakers = len(unique_speakers)
 
     print(f"👥 Found {num_speakers} unique speakers: {unique_speakers}")
-
     if num_speakers == 0:
         raise ValueError("⚠️ No valid speakers found in this conversation.")
 
-    if num_speakers > 3:
-        print(f"⚠️ Skipping conversation with >3 speakers: {unique_speakers}")
-        return None
+    # map speakers to voices round‑robin
+    speaker_voice = {
+        speaker: VOICE_SLOTS[i % len(VOICE_SLOTS)]
+        for i, speaker in enumerate(unique_speakers)
+    }
+    print(f"🗣 Speaker → Voice mapping: {speaker_voice}")
 
-    # Map speakers to voices
-    speaker_voice_map = {}
-    for i, speaker in enumerate(unique_speakers):
-        speaker_voice_map[speaker] = VOICE_SLOTS[i % len(VOICE_SLOTS)]
+    out_dir = Path(output_dir)
+    final_dir = out_dir / "final"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"🗣 Speaker → Voice mapping: {speaker_voice_map}")
-
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    for i, utt in enumerate(utterances):
-        current_text = utt["text"]
-        ssml_prompt = f"<speak>{current_text}</speak>"
-
-        for speaker_id, voice in speaker_voice_map.items():
-            print(f"🎙️ Generating turn {i+1}/{len(utterances)} for {speaker_id} using {voice['name']}")
-
-            audio_stream = client.text_to_speech.convert(
-                text=ssml_prompt,
+    for turn_idx, utt in enumerate(utterances, start=1):
+        text = utt["text"]
+        ssml = f"<speak>{text}</speak>"
+        for speaker in unique_speakers:
+            voice = speaker_voice[speaker]
+            fname = f"{speaker}_{conversation_id}_{turn_idx}.mp3"
+            out_path = out_dir / fname
+            skip_path = final_dir / fname
+            if skip_path.exists():
+                print(f"⏭️ Skipping existing in final/: {fname}")
+                continue
+            print(f"🎙️ Generating {fname} with {voice['name']}")
+            stream = client.text_to_speech.convert(
+                text=ssml,
                 voice_id=voice["voice_id"],
                 model_id="eleven_multilingual_v2",
                 voice_settings={"ssml": True},
                 output_format="mp3_44100_128",
             )
-
-            file_name = f"{speaker_id}_{conversation_id}_{i+1}.mp3"
-            out_file = Path(output_dir) / file_name
-
-            with open(out_file, "wb") as f:
-                for chunk in audio_stream:
+            with open(out_path, "wb") as f:
+                for chunk in stream:
                     f.write(chunk)
-
-            print(f"✅ Saved: {out_file}")
+            print(f"✅ Saved: {fname}")
 
 
 def main():
@@ -120,20 +120,15 @@ def main():
         return
 
     corpus_dir = os.path.expanduser(f"~/.convokit/saved-corpora/{args.corpus_name}")
-
+    client = ElevenLabs(api_key=key)
     try:
         utterances = fetch_utterances_for_conversation(corpus_dir, args.conversation_id)
-
-        client = ElevenLabs(api_key=key)
-
         generate_all_speakers_per_turn(
             client, utterances, args.conversation_id, args.output
         )
-
-        print(f"✅ Completed generating turn files for {args.conversation_id} (all speakers voice each turn).")
+        print("✅ Completed generating turn files.")
     except Exception as e:
         print(f"❌ Generation failed: {e}")
-
 
 if __name__ == "__main__":
     main()
